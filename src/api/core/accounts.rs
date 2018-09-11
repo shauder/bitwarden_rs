@@ -5,6 +5,8 @@ use db::models::*;
 
 use api::{PasswordData, JsonResult, EmptyResult, JsonUpcase, NumberOrString};
 use auth::Headers;
+use fast_chemail::is_valid_email;
+use mail;
 
 use CONFIG;
 
@@ -30,15 +32,34 @@ struct KeysData {
 fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
     let data: RegisterData = data.into_inner().data;
 
-    if !CONFIG.signups_allowed {
-        err!("Signups not allowed")
-    }
 
-    if User::find_by_mail(&data.Email, &conn).is_some() {
-        err!("Email already exists")
-    }
+    let mut user = match User::find_by_mail(&data.Email, &conn) {
+        Some(mut user) => {
+            if Invitation::take(&data.Email, &conn) {
+                for mut user_org in UserOrganization::find_invited_by_user(&user.uuid, &conn).iter_mut() {
+                    user_org.status = UserOrgStatus::Accepted as i32;
+                    user_org.save(&conn);
+                };
+                user
+            } else {
+                if CONFIG.signups_allowed {
+                    err!("Account with this email already exists")
+                } else {
+                    err!("Registration not allowed")
+                }
+            }
+        },
+        None => {
+            if CONFIG.signups_allowed || Invitation::take(&data.Email, &conn) {
+                User::new(data.Email)
+            } else {
+                err!("Registration not allowed")
+            }
+        }
+    };
 
-    let mut user = User::new(data.Email, data.Key, data.MasterPasswordHash);
+    user.set_password(&data.MasterPasswordHash);
+    user.key = data.Key;
 
     // Add extra fields if present
     if let Some(name) = data.Name {
@@ -85,7 +106,10 @@ fn post_profile(data: JsonUpcase<ProfileData>, headers: Headers, conn: DbConn) -
     let mut user = headers.user;
 
     user.name = data.Name;
-    user.password_hint = data.MasterPasswordHint;
+    user.password_hint = match data.MasterPasswordHint {
+        Some(ref h) if h.is_empty() => None,
+        _ => data.MasterPasswordHint,
+    };
     user.save(&conn);
 
     Ok(Json(user.to_json(&conn)))
@@ -263,17 +287,29 @@ struct PasswordHintData {
 fn password_hint(data: JsonUpcase<PasswordHintData>, conn: DbConn) -> EmptyResult {
     let data: PasswordHintData = data.into_inner().data;
 
-    if !CONFIG.show_password_hint {
-        return Ok(())
+    if !is_valid_email(&data.Email) {
+        return err!("This email address is not valid...");
     }
 
-    match User::find_by_mail(&data.Email, &conn) {
-        Some(user) => {
-            let hint = user.password_hint.to_owned().unwrap_or_default();
-            err!(format!("Your password hint is: {}", hint))
-        },
-        None => Ok(()),
+    let user = User::find_by_mail(&data.Email, &conn);
+    if user.is_none() {
+        return Ok(());
     }
+
+    let user = user.unwrap();
+    if let Some(ref mail_config) = CONFIG.mail {
+        if let Err(e) = mail::send_password_hint(&user.email, user.password_hint, mail_config) {
+            err!(format!("There have been a problem sending the email: {}", e));
+        }
+    } else if CONFIG.show_password_hint {
+        if let Some(hint) = user.password_hint {
+            err!(format!("Your password hint is: {}", &hint));
+        } else {
+            err!(format!("Sorry, you have no password hint..."));
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Deserialize)]
